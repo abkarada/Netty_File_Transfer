@@ -16,8 +16,10 @@ public class SelfSignedCertificateGenerator {
     static {
         try {
             logger.info("Generating self-signed certificate for QUIC...");
-            cert = new SelfSignedCertificate();
-            logger.info("Self-signed certificate generated successfully");
+            // Multi-host desteği için wildcard certificate veya server hostname
+            String hostname = System.getProperty("quic.hostname", "localhost");
+            cert = new SelfSignedCertificate(hostname);
+            logger.info("Self-signed certificate generated successfully for hostname: {}", hostname);
             logger.debug("Certificate file: {}", cert.certificate().getAbsolutePath());
             logger.debug("Private key file: {}", cert.privateKey().getAbsolutePath());
         } catch (Exception e) {

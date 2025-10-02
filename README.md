@@ -41,6 +41,8 @@ java -jar build/libs/QUICC-1.0-SNAPSHOT.jar client localhost 9443 test-files/sam
 
 ## Test Etme
 
+### 🖥️ Aynı Bilgisayarda Test
+
 1. İlk terminal'de server başlatın:
    ```bash
    ./gradlew run --args="server 9443"
@@ -50,6 +52,48 @@ java -jar build/libs/QUICC-1.0-SNAPSHOT.jar client localhost 9443 test-files/sam
    ```bash
    ./gradlew run --args="client localhost 9443 test-files/sample.txt"
    ```
+
+### 🌐 İki Farklı Bilgisayarda Test
+
+1. **Network bilgilerini öğrenin**:
+   ```bash
+   ./scripts/network-info.sh
+   ```
+
+2. **Server bilgisayarında**:
+   ```bash
+   # Firewall ayarı
+   sudo ufw allow 9443/udp
+   
+   # Server başlat (tüm interface'lerde dinler: 0.0.0.0:9443)
+   ./gradlew run --args="server 9443"
+   ```
+
+3. **Client bilgisayarında**:
+   ```bash
+   # Server IP'si ile bağlan (örnek: 10.11.20.55)
+   ./gradlew run --args="client 10.11.20.55 9443 test-files/sample.txt"
+   ```
+
+### 📦 Deployment (Diğer Bilgisayarlara Kurulum)
+
+```bash
+# 1. Deployment paketi oluştur
+./scripts/deploy.sh
+
+# 2. Oluşan tar.gz dosyasını hedef bilgisayara kopyala
+scp quic-deploy-*.tar.gz user@target-machine:/path/to/
+
+# 3. Hedef bilgisayarda kurulum
+tar -xzf quic-deploy-*.tar.gz
+cd quic-deploy-*
+
+# 4. Server çalıştır
+./run-server.sh
+
+# 5. Client çalıştır (başka bilgisayarda)
+./run-client.sh <server-ip> test-files/sample.txt
+```
 
 ## ✅ Test Sonuçları
 

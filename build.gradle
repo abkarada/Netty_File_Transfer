@@ -1,6 +1,7 @@
 plugins {
     id 'java'
     id 'application'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
 }
 
 group = 'com.quicc'
@@ -49,3 +50,25 @@ run {
         '-Dfile.encoding=UTF-8'
     ]
 }
+
+// Shadow JAR configuration for standalone executable
+shadowJar {
+    archiveBaseName = 'quic-transfer'
+    archiveClassifier = ''
+    archiveVersion = ''
+    
+    manifest {
+        attributes 'Main-Class': 'quic.FileTransferMain'
+    }
+    
+    // Native library handling for QUIC
+    mergeServiceFiles()
+    
+    // Exclude duplicate files
+    exclude 'META-INF/*.SF'
+    exclude 'META-INF/*.DSA'
+    exclude 'META-INF/*.RSA'
+}
+
+// Make shadowJar the default jar
+build.dependsOn shadowJar

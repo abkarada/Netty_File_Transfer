@@ -1013,3 +1013,54 @@ io.netty.util.IllegalReferenceCountException: refCnt: 0, decrement: 1
 2025-10-02 19:36:14.495 [nioEventLoopGroup-2-1] INFO  q.FileTransferMain$FileReceiveHandler -   Total bytes: 628
 2025-10-02 19:36:14.495 [nioEventLoopGroup-2-1] INFO  q.FileTransferMain$FileReceiveHandler -   Duration: 111 ms
 2025-10-02 19:36:14.495 [nioEventLoopGroup-2-1] INFO  q.FileTransferMain$FileReceiveHandler -   Throughput: %.2f Mbps
+2025-10-02 19:59:53.964 [main] INFO  quic.FileTransferMain - Starting QUIC server on port 9443
+2025-10-02 19:59:54.001 [main] INFO  quic.SelfSignedCertificateGenerator - Generating self-signed certificate for QUIC...
+2025-10-02 19:59:54.292 [main] INFO  quic.SelfSignedCertificateGenerator - Self-signed certificate generated successfully for hostname: localhost
+2025-10-02 19:59:54.292 [main] DEBUG quic.SelfSignedCertificateGenerator - Certificate file: /tmp/keyutil_localhost_7469840711597945490.crt
+2025-10-02 19:59:54.292 [main] DEBUG quic.SelfSignedCertificateGenerator - Private key file: /tmp/keyutil_localhost_6378453723512214968.key
+2025-10-02 19:59:54.471 [main] INFO  quic.FileTransferMain - QUIC server started successfully on port 9443
+2025-10-02 20:00:20.737 [main] INFO  quic.FileTransferMain - Starting QUIC client - connecting to localhost:9443
+2025-10-02 20:00:20.738 [main] INFO  quic.FileTransferMain - File to send: test-files/sample.txt
+2025-10-02 20:00:20.738 [main] INFO  quic.FileTransferMain - File size: 628 bytes
+2025-10-02 20:00:20.832 [main] DEBUG quic.FileTransferMain - Connecting to server...
+2025-10-02 20:00:20.905 [nioEventLoopGroup-2-1] DEBUG i.netty.incubator.codec.quic.Quiche - quiche::tls: 6dbbf1686b0874b9b7aa296691a933596ec5044b write message lvl=Initial len=227
+2025-10-02 20:00:20.905 [nioEventLoopGroup-2-1] DEBUG i.netty.incubator.codec.quic.Quiche - quiche: 6dbbf1686b0874b9b7aa296691a933596ec5044b tx pkt Initial version=1 dcid=e1f9a4447fc15879d3e468357b943c9a scid=6dbbf1686b0874b9b7aa296691a933596ec5044b len=231 pn=0
+2025-10-02 20:00:20.905 [nioEventLoopGroup-2-1] DEBUG i.netty.incubator.codec.quic.Quiche - quiche: 6dbbf1686b0874b9b7aa296691a933596ec5044b tx frm CRYPTO off=0 len=227
+2025-10-02 20:00:20.905 [nioEventLoopGroup-2-1] DEBUG i.netty.incubator.codec.quic.Quiche - quiche::recovery: 6dbbf1686b0874b9b7aa296691a933596ec5044b timer=998.908503ms latest_rtt=0ns srtt=None min_rtt=0ns rttvar=166.5ms loss_time=[None, None, None] loss_probes=[0, 0, 0] cwnd=12000 ssthresh=18446744073709551615 bytes_in_flight=294 app_limited=true congestion_recovery_start_time=None delivered=0 delivered_time=95.728µs recent_delivered_packet_sent_time=95.963µs app_limited_at_pkt=0  pacing_rate=0 last_packet_scheduled_time=Some(Instant { tv_sec: 63286, tv_nsec: 240450616 }) hystart=window_end=None last_round_min_rtt=18446744073709551615.999999999s current_round_min_rtt=18446744073709551615.999999999s css_baseline_min_rtt=18446744073709551615.999999999s rtt_sample_count=0 css_start_time=None css_round_count=0  
+2025-10-02 20:00:20.907 [nioEventLoopGroup-2-1] WARN  i.n.channel.DefaultChannelPipeline - An exceptionCaught() event was fired, and it reached at the tail of the pipeline. It usually means the last handler in the pipeline did not handle the exception.
+java.net.PortUnreachableException: null
+	at java.base/sun.nio.ch.DatagramChannelImpl.receive0(Native Method)
+	at java.base/sun.nio.ch.DatagramChannelImpl.receiveIntoNativeBuffer(DatagramChannelImpl.java:750)
+	at java.base/sun.nio.ch.DatagramChannelImpl.receive(DatagramChannelImpl.java:728)
+	at java.base/sun.nio.ch.DatagramChannelImpl.receive(DatagramChannelImpl.java:543)
+	at io.netty.channel.socket.nio.NioDatagramChannel.doReadMessages(NioDatagramChannel.java:253)
+	at io.netty.channel.nio.AbstractNioMessageChannel$NioMessageUnsafe.read(AbstractNioMessageChannel.java:79)
+	at io.netty.channel.nio.NioEventLoop.processSelectedKey(NioEventLoop.java:719)
+	at io.netty.channel.nio.NioEventLoop.processSelectedKeysOptimized(NioEventLoop.java:655)
+	at io.netty.channel.nio.NioEventLoop.processSelectedKeys(NioEventLoop.java:581)
+	at io.netty.channel.nio.NioEventLoop.run(NioEventLoop.java:493)
+	at io.netty.util.concurrent.SingleThreadEventExecutor$4.run(SingleThreadEventExecutor.java:986)
+	at io.netty.util.internal.ThreadExecutorMap$2.run(ThreadExecutorMap.java:74)
+	at io.netty.util.concurrent.FastThreadLocalRunnable.run(FastThreadLocalRunnable.java:30)
+	at java.base/java.lang.Thread.run(Thread.java:840)
+2025-10-02 20:00:21.906 [nioEventLoopGroup-2-1] DEBUG i.netty.incubator.codec.quic.Quiche - quiche: 6dbbf1686b0874b9b7aa296691a933596ec5044b loss detection timeout expired
+2025-10-02 20:00:21.907 [nioEventLoopGroup-2-1] DEBUG i.netty.incubator.codec.quic.Quiche - quiche::recovery: 6dbbf1686b0874b9b7aa296691a933596ec5044b timer=995.669702ms latest_rtt=0ns srtt=None min_rtt=0ns rttvar=166.5ms loss_time=[None, None, None] loss_probes=[1, 0, 0] cwnd=12000 ssthresh=18446744073709551615 bytes_in_flight=294 app_limited=true congestion_recovery_start_time=None delivered=0 delivered_time=1.002347132s recent_delivered_packet_sent_time=1.002348598s app_limited_at_pkt=0  pacing_rate=0 last_packet_scheduled_time=Some(Instant { tv_sec: 63286, tv_nsec: 240450616 }) hystart=window_end=None last_round_min_rtt=18446744073709551615.999999999s current_round_min_rtt=18446744073709551615.999999999s css_baseline_min_rtt=18446744073709551615.999999999s rtt_sample_count=0 css_start_time=None css_round_count=0  
+2025-10-02 20:00:21.909 [nioEventLoopGroup-2-1] DEBUG i.netty.incubator.codec.quic.Quiche - quiche: 6dbbf1686b0874b9b7aa296691a933596ec5044b tx pkt Initial version=1 dcid=e1f9a4447fc15879d3e468357b943c9a scid=6dbbf1686b0874b9b7aa296691a933596ec5044b len=231 pn=1
+2025-10-02 20:00:21.910 [nioEventLoopGroup-2-1] DEBUG i.netty.incubator.codec.quic.Quiche - quiche: 6dbbf1686b0874b9b7aa296691a933596ec5044b tx frm CRYPTO off=0 len=227
+2025-10-02 20:00:21.910 [nioEventLoopGroup-2-1] DEBUG i.netty.incubator.codec.quic.Quiche - quiche::recovery: 6dbbf1686b0874b9b7aa296691a933596ec5044b timer=1.996515426s latest_rtt=0ns srtt=None min_rtt=0ns rttvar=166.5ms loss_time=[None, None, None] loss_probes=[0, 0, 0] cwnd=12000 ssthresh=18446744073709551615 bytes_in_flight=588 app_limited=true congestion_recovery_start_time=None delivered=0 delivered_time=1.005228525s recent_delivered_packet_sent_time=1.005229303s app_limited_at_pkt=0  pacing_rate=0 last_packet_scheduled_time=Some(Instant { tv_sec: 63287, tv_nsec: 244181349 }) hystart=window_end=None last_round_min_rtt=18446744073709551615.999999999s current_round_min_rtt=18446744073709551615.999999999s css_baseline_min_rtt=18446744073709551615.999999999s rtt_sample_count=0 css_start_time=None css_round_count=0  
+2025-10-02 20:00:21.912 [nioEventLoopGroup-2-1] WARN  i.n.channel.DefaultChannelPipeline - An exceptionCaught() event was fired, and it reached at the tail of the pipeline. It usually means the last handler in the pipeline did not handle the exception.
+java.net.PortUnreachableException: null
+	at java.base/sun.nio.ch.DatagramChannelImpl.receive0(Native Method)
+	at java.base/sun.nio.ch.DatagramChannelImpl.receiveIntoNativeBuffer(DatagramChannelImpl.java:750)
+	at java.base/sun.nio.ch.DatagramChannelImpl.receive(DatagramChannelImpl.java:728)
+	at java.base/sun.nio.ch.DatagramChannelImpl.receive(DatagramChannelImpl.java:543)
+	at io.netty.channel.socket.nio.NioDatagramChannel.doReadMessages(NioDatagramChannel.java:253)
+	at io.netty.channel.nio.AbstractNioMessageChannel$NioMessageUnsafe.read(AbstractNioMessageChannel.java:79)
+	at io.netty.channel.nio.NioEventLoop.processSelectedKey(NioEventLoop.java:719)
+	at io.netty.channel.nio.NioEventLoop.processSelectedKeysOptimized(NioEventLoop.java:655)
+	at io.netty.channel.nio.NioEventLoop.processSelectedKeys(NioEventLoop.java:581)
+	at io.netty.channel.nio.NioEventLoop.run(NioEventLoop.java:493)
+	at io.netty.util.concurrent.SingleThreadEventExecutor$4.run(SingleThreadEventExecutor.java:986)
+	at io.netty.util.internal.ThreadExecutorMap$2.run(ThreadExecutorMap.java:74)
+	at io.netty.util.concurrent.FastThreadLocalRunnable.run(FastThreadLocalRunnable.java:30)
+	at java.base/java.lang.Thread.run(Thread.java:840)
