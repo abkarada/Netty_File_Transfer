@@ -12,7 +12,10 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.net.InetSocketAddress;
 
 /**
@@ -200,11 +203,28 @@ public class FileTransferMain {
         private static final Logger logger = LoggerFactory.getLogger(FileReceiveHandler.class);
         private long totalReceived = 0;
         private long startTime;
+        private FileOutputStream fileOutputStream;
+        private File receivedFile;
+        private static final String RECEIVED_FILES_DIR = "received-files";
         
         @Override
         public void channelActive(ChannelHandlerContext ctx) throws Exception {
             logger.info("File receive stream activated: {}", ctx.channel());
             startTime = System.currentTimeMillis();
+            
+            // Received files klasörünü oluştur
+            File dir = new File(RECEIVED_FILES_DIR);
+            if (!dir.exists()) {
+                dir.mkdirs();
+                logger.info("Created directory: {}", RECEIVED_FILES_DIR);
+            }
+            
+            // Timestamp ile unique dosya adı oluştur
+            String timestamp = String.valueOf(System.currentTimeMillis());
+            receivedFile = new File(dir, "received_file_" + timestamp + ".dat");
+            fileOutputStream = new FileOutputStream(receivedFile);
+            
+            logger.info("Ready to receive file: {}", receivedFile.getAbsolutePath());
             super.channelActive(ctx);
         }
         
@@ -217,8 +237,16 @@ public class FileTransferMain {
                 
                 logger.debug("Received {} bytes, total: {} bytes", readableBytes, totalReceived);
                 
-                // Burada dosyayı diske yazabilirsiniz
-                // Şimdilik sadece log basalım
+                // Dosyayı diske yaz
+                try {
+                    byte[] data = new byte[readableBytes];
+                    buf.readBytes(data);
+                    fileOutputStream.write(data);
+                    fileOutputStream.flush(); // Her chunk'ı hemen yaz
+                } catch (IOException e) {
+                    logger.error("Error writing to file", e);
+                    ctx.close();
+                }
                 
                 buf.release();
             }
@@ -227,10 +255,20 @@ public class FileTransferMain {
         
         @Override
         public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+            // Dosya stream'ini kapat
+            if (fileOutputStream != null) {
+                try {
+                    fileOutputStream.close();
+                } catch (IOException e) {
+                    logger.warn("Error closing file output stream", e);
+                }
+            }
+            
             long duration = System.currentTimeMillis() - startTime;
             double throughputMbps = (totalReceived * 8.0 / 1_000_000) / (duration / 1000.0);
             
             logger.info("File receive completed:");
+            logger.info("  File saved: {}", receivedFile != null ? receivedFile.getAbsolutePath() : "unknown");
             logger.info("  Total bytes: {}", totalReceived);
             logger.info("  Duration: {} ms", duration);
             logger.info("  Throughput: {:.2f} Mbps", throughputMbps);
