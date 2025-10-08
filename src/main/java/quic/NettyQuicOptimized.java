@@ -68,9 +68,9 @@ public class NettyQuicOptimized {
             ChannelHandler codec = new QuicServerCodecBuilder()
                     .sslContext(sslContext)
                     .maxIdleTimeout(600000, TimeUnit.MILLISECONDS) // 10 minutes
-                    .initialMaxData(50_000_000L) // 50MB total connection
-                    .initialMaxStreamDataBidirectionalLocal(1_000_000L) // 1MB per stream
-                    .initialMaxStreamDataBidirectionalRemote(1_000_000L) // 1MB per stream
+                    .initialMaxData(100_000_000L) // 🔥 100MB total - prevent flow control stall
+                    .initialMaxStreamDataBidirectionalLocal(10_000_000L) // 🔥 10MB per stream
+                    .initialMaxStreamDataBidirectionalRemote(10_000_000L) // 🔥 10MB per stream
                     .initialMaxStreamsBidirectional(1000) // 🔥 SUPPORT 1000 STREAMS
                     .maxRecvUdpPayloadSize(1350) // Larger packets
                     .maxSendUdpPayloadSize(1350) // Larger packets  
@@ -134,8 +134,8 @@ public class NettyQuicOptimized {
             ChannelHandler codec = new QuicClientCodecBuilder()
                     .sslContext(sslContext)
                     .maxIdleTimeout(600000, TimeUnit.MILLISECONDS) // 10 minutes
-                    .initialMaxData(50_000_000L) // 50MB total connection
-                    .initialMaxStreamDataBidirectionalLocal(1_000_000L) // 1MB per stream
+                    .initialMaxData(100_000_000L) // 🔥 100MB total - prevent flow control stall
+                    .initialMaxStreamDataBidirectionalLocal(10_000_000L) // 🔥 10MB per stream
                     .maxRecvUdpPayloadSize(1350) // Larger packets
                     .maxSendUdpPayloadSize(1350) // Larger packets
                     .congestionControlAlgorithm(QuicCongestionControlAlgorithm.CUBIC)
@@ -176,8 +176,8 @@ public class NettyQuicOptimized {
     static class MultiStreamFileTransfer {
         private final QuicChannel quicChannel;
         private final File file;
-        private final int STREAM_COUNT = 16; // 🔥 16 PARALLEL STREAMS
-        private final int CHUNK_SIZE = 64 * 1024; // 64KB per chunk (Netty example pattern)
+        private final int STREAM_COUNT = 4; // 🔥 4 STREAMS - less contention
+        private final int CHUNK_SIZE = 256 * 1024; // 🔥 256KB chunks - larger to reduce overhead
         private final AtomicLong totalSent = new AtomicLong(0);
         private final long startTime = System.currentTimeMillis();
         private final CountDownLatch completionLatch = new CountDownLatch(STREAM_COUNT);
@@ -194,20 +194,29 @@ public class NettyQuicOptimized {
             logger.info("🚀 Starting MULTI-STREAM transfer: {} streams, {}KB per stream", 
                        STREAM_COUNT, chunkPerStream / 1024);
             
+            // 🔥 CREATE ALL STREAMS FIRST, THEN START TRANSFER
+            QuicStreamChannel[] streams = new QuicStreamChannel[STREAM_COUNT];
+            
+            for (int i = 0; i < STREAM_COUNT; i++) {
+                streams[i] = quicChannel.createStream(QuicStreamType.BIDIRECTIONAL,
+                        new ChannelInboundHandlerAdapter()).get();
+            }
+            
+            // 🔥 NOW START TRANSFERS ON ALL STREAMS
             for (int i = 0; i < STREAM_COUNT; i++) {
                 final int streamIndex = i;
                 final long startPos = i * chunkPerStream;
                 final long endPos = (i == STREAM_COUNT - 1) ? fileSize : (i + 1) * chunkPerStream;
                 
-                quicChannel.createStream(QuicStreamType.BIDIRECTIONAL,
-                        new ChannelInboundHandlerAdapter() {
-                            @Override
-                            public void channelActive(ChannelHandlerContext ctx) {
-                                logger.debug("Stream {} active, transferring bytes {}-{}", 
-                                           streamIndex, startPos, endPos);
-                                transferChunk(ctx, startPos, endPos, streamIndex);
-                            }
-                        }).get();
+                QuicStreamChannel stream = streams[i];
+                stream.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+                    @Override
+                    public void channelActive(ChannelHandlerContext ctx) {
+                        logger.debug("Stream {} active, transferring bytes {}-{}", 
+                                   streamIndex, startPos, endPos);
+                        transferChunk(ctx, startPos, endPos, streamIndex);
+                    }
+                });
             }
             
             // Wait for all streams to complete
