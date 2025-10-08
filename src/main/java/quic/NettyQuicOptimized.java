@@ -194,29 +194,19 @@ public class NettyQuicOptimized {
             logger.info("🚀 Starting MULTI-STREAM transfer: {} streams, {}KB per stream", 
                        STREAM_COUNT, chunkPerStream / 1024);
             
-            // 🔥 CREATE ALL STREAMS FIRST, THEN START TRANSFER
-            QuicStreamChannel[] streams = new QuicStreamChannel[STREAM_COUNT];
-            
-            for (int i = 0; i < STREAM_COUNT; i++) {
-                streams[i] = quicChannel.createStream(QuicStreamType.BIDIRECTIONAL,
-                        new ChannelInboundHandlerAdapter()).get();
-            }
-            
-            // 🔥 NOW START TRANSFERS ON ALL STREAMS
+            // 🔥 DIRECT TRANSFER - NO WAITING FOR channelActive
             for (int i = 0; i < STREAM_COUNT; i++) {
                 final int streamIndex = i;
                 final long startPos = i * chunkPerStream;
                 final long endPos = (i == STREAM_COUNT - 1) ? fileSize : (i + 1) * chunkPerStream;
                 
-                QuicStreamChannel stream = streams[i];
-                stream.pipeline().addLast(new ChannelInboundHandlerAdapter() {
-                    @Override
-                    public void channelActive(ChannelHandlerContext ctx) {
-                        logger.debug("Stream {} active, transferring bytes {}-{}", 
-                                   streamIndex, startPos, endPos);
-                        transferChunk(ctx, startPos, endPos, streamIndex);
-                    }
-                });
+                QuicStreamChannel stream = quicChannel.createStream(QuicStreamType.BIDIRECTIONAL,
+                        new ChannelInboundHandlerAdapter()).get();
+                
+                logger.info("🚀 Starting stream {} transfer: bytes {}-{}", streamIndex, startPos, endPos);
+                
+                // 🔥 START TRANSFER IMMEDIATELY
+                transferChunk(stream, startPos, endPos, streamIndex);
             }
             
             // Wait for all streams to complete
@@ -233,19 +223,19 @@ public class NettyQuicOptimized {
             quicChannel.close();
         }
         
-        private void transferChunk(ChannelHandlerContext ctx, long startPos, long endPos, int streamIndex) {
+        private void transferChunk(QuicStreamChannel stream, long startPos, long endPos, int streamIndex) {
             try {
                 AsynchronousFileChannel fileChannel = AsynchronousFileChannel.open(
                         file.toPath(), StandardOpenOption.READ);
                 
-                sendFileChunk(ctx, fileChannel, startPos, endPos, streamIndex);
+                sendFileChunk(stream, fileChannel, startPos, endPos, streamIndex);
             } catch (IOException e) {
                 logger.error("Error opening file for stream {}", streamIndex, e);
                 completionLatch.countDown();
             }
         }
         
-        private void sendFileChunk(ChannelHandlerContext ctx, AsynchronousFileChannel fileChannel, 
+        private void sendFileChunk(QuicStreamChannel stream, AsynchronousFileChannel fileChannel, 
                                  long currentPos, long endPos, int streamIndex) {
             if (currentPos >= endPos) {
                 // Stream completed
@@ -255,7 +245,7 @@ public class NettyQuicOptimized {
                 } catch (IOException e) {
                     logger.warn("Error closing file channel for stream {}", streamIndex, e);
                 }
-                ctx.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(QuicStreamChannel.SHUTDOWN_OUTPUT);
+                stream.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(QuicStreamChannel.SHUTDOWN_OUTPUT);
                 completionLatch.countDown();
                 return;
             }
@@ -263,9 +253,9 @@ public class NettyQuicOptimized {
             int readSize = (int) Math.min(CHUNK_SIZE, endPos - currentPos);
             ByteBuffer buffer = ByteBuffer.allocateDirect(readSize);
             
-            fileChannel.read(buffer, currentPos, ctx, new CompletionHandler<Integer, ChannelHandlerContext>() {
+            fileChannel.read(buffer, currentPos, stream, new CompletionHandler<Integer, QuicStreamChannel>() {
                 @Override
-                public void completed(Integer bytesRead, ChannelHandlerContext attachment) {
+                public void completed(Integer bytesRead, QuicStreamChannel attachment) {
                     if (bytesRead > 0) {
                         buffer.flip();
                         ByteBuf nettyBuf = attachment.alloc().directBuffer(bytesRead);
@@ -299,7 +289,7 @@ public class NettyQuicOptimized {
                 }
                 
                 @Override
-                public void failed(Throwable exc, ChannelHandlerContext attachment) {
+                public void failed(Throwable exc, QuicStreamChannel attachment) {
                     logger.error("File read failed for stream {}", streamIndex, exc);
                     try {
                         fileChannel.close();
