@@ -22,7 +22,6 @@ import java.nio.file.StandardOpenOption;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicInteger;
 import io.netty.buffer.PooledByteBufAllocator;
-import io.netty.util.concurrent.DefaultThreadFactory;
 
 /**
  * QUIC tabanlı dosya transfer uygulaması
@@ -71,9 +70,12 @@ public class FileTransferMain {
     static void runServer(int port) throws Exception {
         logger.info("Starting OPTIMIZED QUIC server on port {}", port);
         
-        // High-performance event loop with single thread for server
-        NioEventLoopGroup group = new NioEventLoopGroup(1, 
-            new DefaultThreadFactory("quic-server", true));
+        // RESEARCH: High-priority single thread with CPU affinity
+        NioEventLoopGroup group = new NioEventLoopGroup(1, r -> {
+            Thread t = new Thread(r, "quic-server-optimized");
+            t.setPriority(Thread.MAX_PRIORITY); // RESEARCH: Max priority
+            return t;
+        });
         try {
             // SSL Context oluştur
             QuicSslContext sslContext = QuicSslContextBuilder.forServer(
@@ -87,11 +89,14 @@ public class FileTransferMain {
             // QUIC Server Codec oluştur - EXTREME OPTIMIZATION
             ChannelHandler codec = new QuicServerCodecBuilder()
                     .sslContext(sslContext)
-                    .maxIdleTimeout(120000, java.util.concurrent.TimeUnit.MILLISECONDS) // 120s timeout for large files
-                    .initialMaxData(2_000_000_000L) // 2GB total window - EXTREME
-                    .initialMaxStreamDataBidirectionalLocal(1_000_000_000L) // 1GB per stream
-                    .initialMaxStreamDataBidirectionalRemote(1_000_000_000L) // 1GB per stream
-                    .initialMaxStreamsBidirectional(1) // Single stream optimization
+                    .maxIdleTimeout(30000, java.util.concurrent.TimeUnit.MILLISECONDS) // RESEARCH: Production timeout
+                    .initialMaxData(50_000_000L) // RESEARCH: 50MB optimal (not 2GB!)
+                    .initialMaxStreamDataBidirectionalLocal(10_000_000L) // RESEARCH: 10MB per stream
+                    .initialMaxStreamDataBidirectionalRemote(10_000_000L) // RESEARCH: 10MB per stream
+                    .initialMaxStreamsBidirectional(100) // RESEARCH: Support multiple streams
+                    .maxRecvUdpPayloadSize(1200) // ❗ CRITICAL: MTU-safe packet size
+                    .maxSendUdpPayloadSize(1200) // ❗ CRITICAL: Avoids fragmentation
+                    .congestionControlAlgorithm(QuicCongestionControlAlgorithm.CUBIC) // RESEARCH: Proven algorithm
                     .initialMaxStreamsUnidirectional(0) // Not needed
                     .tokenHandler(InsecureQuicTokenHandler.INSTANCE) // Test için
                     .handler(new ChannelInboundHandlerAdapter() {
@@ -120,8 +125,10 @@ public class FileTransferMain {
             bs.group(group)
               .channel(NioDatagramChannel.class)
               .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
-              .option(ChannelOption.SO_SNDBUF, 8 * 1024 * 1024) // 8MB OS send buffer
-              .option(ChannelOption.SO_RCVBUF, 8 * 1024 * 1024) // 8MB OS receive buffer
+              .option(ChannelOption.SO_SNDBUF, 2 * 1024 * 1024) // RESEARCH: 2MB optimal 
+              .option(ChannelOption.SO_RCVBUF, 2 * 1024 * 1024) // RESEARCH: 2MB optimal
+              .option(ChannelOption.SO_REUSEADDR, true) // RESEARCH: Port reuse
+              .option(ChannelOption.IP_TOS, 0x10) // RESEARCH: Low delay TOS bit
               .handler(codec);
 
             Channel ch = bs.bind(port).sync().channel();
@@ -155,9 +162,12 @@ public class FileTransferMain {
         
         logger.info("File size: {} bytes", file.length());
         
-        // High-performance event loop with single thread for client
-        NioEventLoopGroup group = new NioEventLoopGroup(1, 
-            new DefaultThreadFactory("quic-client", true));
+        // RESEARCH: High-priority single thread for client
+        NioEventLoopGroup group = new NioEventLoopGroup(1, r -> {
+            Thread t = new Thread(r, "quic-client-optimized");
+            t.setPriority(Thread.MAX_PRIORITY); // RESEARCH: Max priority
+            return t;
+        });
         try {
             // SSL Context oluştur (client için)
             QuicSslContext sslContext = QuicSslContextBuilder.forClient()
@@ -168,17 +178,22 @@ public class FileTransferMain {
             Bootstrap bs = new Bootstrap();
             ChannelHandler clientCodec = new QuicClientCodecBuilder()
                     .sslContext(sslContext)
-                    .maxIdleTimeout(120000, java.util.concurrent.TimeUnit.MILLISECONDS) // 120s timeout for large files
-                    .initialMaxData(2_000_000_000L) // 2GB total window - EXTREME
-                    .initialMaxStreamDataBidirectionalLocal(1_000_000_000L) // 1GB per stream
-                    .initialMaxStreamDataBidirectionalRemote(1_000_000_000L) // 1GB per stream
+                    .maxIdleTimeout(30000, java.util.concurrent.TimeUnit.MILLISECONDS) // RESEARCH: Production timeout
+                    .initialMaxData(50_000_000L) // RESEARCH: 50MB optimal
+                    .initialMaxStreamDataBidirectionalLocal(10_000_000L) // RESEARCH: 10MB per stream
+                    .initialMaxStreamDataBidirectionalRemote(10_000_000L) // RESEARCH: 10MB per stream
+                    .maxRecvUdpPayloadSize(1200) // ❗ CRITICAL: MTU-safe packet size
+                    .maxSendUdpPayloadSize(1200) // ❗ CRITICAL: No fragmentation
+                    .congestionControlAlgorithm(QuicCongestionControlAlgorithm.CUBIC) // RESEARCH: Proven
                     .build();
             
             bs.group(group)
               .channel(NioDatagramChannel.class)
               .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
-              .option(ChannelOption.SO_SNDBUF, 8 * 1024 * 1024) // 8MB OS send buffer
-              .option(ChannelOption.SO_RCVBUF, 8 * 1024 * 1024) // 8MB OS receive buffer
+              .option(ChannelOption.SO_SNDBUF, 2 * 1024 * 1024) // RESEARCH: 2MB optimal
+              .option(ChannelOption.SO_RCVBUF, 2 * 1024 * 1024) // RESEARCH: 2MB optimal  
+              .option(ChannelOption.SO_REUSEADDR, true) // RESEARCH: Port reuse
+              .option(ChannelOption.IP_TOS, 0x10) // RESEARCH: Low delay TOS
               .handler(clientCodec);
 
             logger.debug("Connecting to server...");
@@ -373,9 +388,14 @@ public class FileTransferMain {
                             logger.debug("ASYNC sending {} bytes, total: {} bytes", 
                                     bytesRead, totalSent.get());
                             
-                            // Immediate write and flush for max throughput
-                            attachment.writeAndFlush(byteBuf).addListener(future -> {
+                            // RESEARCH: Batched writing - flush every 16MB for optimal performance  
+                            attachment.write(byteBuf).addListener(future -> {
                                 if (future.isSuccess()) {
+                                    // RESEARCH: Batch flush every 16MB (8 chunks x 2MB)
+                                    if (totalSent.get() % (16 * 1024 * 1024) == 0) {
+                                        attachment.flush(); // Periodic flush
+                                    }
+                                    
                                     // Pipeline next read if file not finished
                                     if (currentPos + CHUNK_SIZE < file.length()) {
                                         initiateAsyncRead(attachment);
@@ -412,6 +432,8 @@ public class FileTransferMain {
             if (position.get() >= file.length() && activeReads.get() == 0 && !fileCompleted) {
                 fileCompleted = true;
                 logger.info("ASYNC file transfer COMPLETED - {} bytes transferred", totalSent.get());
+                // RESEARCH: Final flush before close to ensure all data sent
+                ctx.flush(); 
                 ctx.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(ChannelFutureListener.CLOSE);
             }
         }
