@@ -172,53 +172,50 @@ public class NettyQuicOptimized {
         }
     }
 
-    // 🔥 MULTI-STREAM FILE TRANSFER IMPLEMENTATION
+    // 🔥 PIPELINE MULTI-STREAM FILE TRANSFER IMPLEMENTATION
     static class MultiStreamFileTransfer {
         private final QuicChannel quicChannel;
         private final File file;
-        private final int STREAM_COUNT = 4; // 🔥 4 STREAMS - less contention
-        private final int CHUNK_SIZE = 256 * 1024; // 🔥 256KB chunks - larger to reduce overhead
+        private final int STREAM_COUNT = 4; // 🔥 4 STREAMS for pipeline
+        private final int CHUNK_SIZE = 64 * 1024; // 🔥 64KB chunks for faster response
         private final AtomicLong totalSent = new AtomicLong(0);
         private final long startTime = System.currentTimeMillis();
-        private final CountDownLatch completionLatch = new CountDownLatch(STREAM_COUNT);
+        private final AtomicLong currentPosition = new AtomicLong(0);
+        private final long fileSize;
+        private volatile boolean transferComplete = false;
         
         MultiStreamFileTransfer(QuicChannel quicChannel, File file) {
             this.quicChannel = quicChannel;
             this.file = file;
+            this.fileSize = file.length();
         }
         
-        void start() throws Exception {
-            long fileSize = file.length();
-            long chunkPerStream = fileSize / STREAM_COUNT;
+        void start() throws Exception {            
+            logger.info("🚀 Starting PIPELINE transfer: {} streams, {}KB chunks, total {}KB", 
+                       STREAM_COUNT, CHUNK_SIZE / 1024, fileSize / 1024);
             
-            logger.info("🚀 Starting MULTI-STREAM transfer: {} streams, {}KB per stream", 
-                       STREAM_COUNT, chunkPerStream / 1024);
-            
-            // 🔥 CREATE STREAMS WITH IMMEDIATE TRANSFER START
+            // 🔥 CREATE PIPELINE STREAMS - Each stream requests next available chunk
             for (int i = 0; i < STREAM_COUNT; i++) {
                 final int streamIndex = i;
-                final long startPos = i * chunkPerStream;
-                final long endPos = (i == STREAM_COUNT - 1) ? fileSize : (i + 1) * chunkPerStream;
                 
-                logger.info("🔧 Creating stream {} for bytes {}-{}", streamIndex, startPos, endPos);
-                
-                // Create stream with immediate transfer handler
                 QuicStreamChannel stream = quicChannel.createStream(QuicStreamType.BIDIRECTIONAL,
                         new ChannelInboundHandlerAdapter()).get();
                 
-                logger.info("✅ Stream {} created, starting immediate transfer", streamIndex);
+                logger.info("✅ Pipeline stream {} created", streamIndex);
                 
-                // 🔥 START TRANSFER IMMEDIATELY WITHOUT MARKERS
-                transferChunk(stream, startPos, endPos, streamIndex);
+                // 🔥 START PIPELINE CHUNK TRANSFER
+                sendNextChunk(stream, streamIndex);
             }
             
-            // Wait for all streams to complete
-            completionLatch.await();
+            // Wait until all file transferred
+            while (!transferComplete && totalSent.get() < fileSize) {
+                Thread.sleep(10);
+            }
             
             long duration = System.currentTimeMillis() - startTime;
             double throughputMbps = (totalSent.get() * 8.0 / 1_000_000) / (duration / 1000.0);
             
-            logger.info("🔥 MULTI-STREAM Transfer COMPLETED!");
+            logger.info("🔥 PIPELINE Transfer COMPLETED!");
             logger.info("  Total bytes: {}", totalSent.get());
             logger.info("  Duration: {} ms", duration);
             logger.info("  Throughput: {:.2f} Mbps", throughputMbps);
@@ -226,39 +223,51 @@ public class NettyQuicOptimized {
             quicChannel.close();
         }
         
-        private void transferChunk(QuicStreamChannel stream, long startPos, long endPos, int streamIndex) {
+        private void sendNextChunk(QuicStreamChannel stream, int streamIndex) {
+            // 🔥 Get next sequential chunk position
+            long chunkStart = currentPosition.getAndAdd(CHUNK_SIZE);
+            
+            if (chunkStart >= fileSize) {
+                // No more chunks, close stream
+                logger.debug("Stream {} finished - no more chunks", streamIndex);
+                stream.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(QuicStreamChannel.SHUTDOWN_OUTPUT);
+                
+                // Check if all done
+                if (totalSent.get() >= fileSize) {
+                    transferComplete = true;
+                }
+                return;
+            }
+            
+            long chunkEnd = Math.min(chunkStart + CHUNK_SIZE, fileSize);
+            int chunkSize = (int)(chunkEnd - chunkStart);
+            
+            logger.debug("Stream {} sending chunk: {}-{} ({}KB)", 
+                streamIndex, chunkStart, chunkEnd, chunkSize / 1024);
+            
             try {
                 AsynchronousFileChannel fileChannel = AsynchronousFileChannel.open(
                         file.toPath(), StandardOpenOption.READ);
                 
-                sendFileChunk(stream, fileChannel, startPos, endPos, streamIndex);
+                sendChunkData(stream, fileChannel, chunkStart, chunkSize, streamIndex);
             } catch (IOException e) {
                 logger.error("Error opening file for stream {}", streamIndex, e);
-                completionLatch.countDown();
             }
         }
         
-        private void sendFileChunk(QuicStreamChannel stream, AsynchronousFileChannel fileChannel, 
-                                 long currentPos, long endPos, int streamIndex) {
-            if (currentPos >= endPos) {
-                // Stream completed
-                logger.debug("Stream {} completed", streamIndex);
-                try {
-                    fileChannel.close();
-                } catch (IOException e) {
-                    logger.warn("Error closing file channel for stream {}", streamIndex, e);
-                }
-                stream.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(QuicStreamChannel.SHUTDOWN_OUTPUT);
-                completionLatch.countDown();
-                return;
-            }
+        private void sendChunkData(QuicStreamChannel stream, AsynchronousFileChannel fileChannel,
+                                 long position, int size, int streamIndex) {
+            ByteBuffer buffer = ByteBuffer.allocateDirect(size);
             
-            int readSize = (int) Math.min(CHUNK_SIZE, endPos - currentPos);
-            ByteBuffer buffer = ByteBuffer.allocateDirect(readSize);
-            
-            fileChannel.read(buffer, currentPos, stream, new CompletionHandler<Integer, QuicStreamChannel>() {
+            fileChannel.read(buffer, position, stream, new CompletionHandler<Integer, QuicStreamChannel>() {
                 @Override
                 public void completed(Integer bytesRead, QuicStreamChannel attachment) {
+                    try {
+                        fileChannel.close();
+                    } catch (IOException e) {
+                        logger.warn("Error closing file channel", e);
+                    }
+                    
                     if (bytesRead > 0) {
                         buffer.flip();
                         ByteBuf nettyBuf = attachment.alloc().directBuffer(bytesRead);
@@ -267,27 +276,18 @@ public class NettyQuicOptimized {
                         attachment.writeAndFlush(nettyBuf).addListener(future -> {
                             if (future.isSuccess()) {
                                 totalSent.addAndGet(bytesRead);
-                                // Continue with next chunk
-                                sendFileChunk(attachment, fileChannel, currentPos + bytesRead, endPos, streamIndex);
+                                logger.debug("Stream {} sent {}KB, total: {}KB", 
+                                    streamIndex, bytesRead / 1024, totalSent.get() / 1024);
+                                
+                                // 🔥 IMMEDIATELY REQUEST NEXT CHUNK
+                                sendNextChunk(attachment, streamIndex);
                             } else {
                                 logger.error("Write failed for stream {}", streamIndex, future.cause());
-                                try {
-                                    fileChannel.close();
-                                } catch (IOException e) {
-                                    logger.warn("Error closing file channel", e);
-                                }
-                                completionLatch.countDown();
                             }
                         });
                     } else {
-                        // End of stream
-                        try {
-                            fileChannel.close();
-                        } catch (IOException e) {
-                            logger.warn("Error closing file channel", e);
-                        }
+                        logger.debug("Stream {} read 0 bytes", streamIndex);
                         attachment.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(QuicStreamChannel.SHUTDOWN_OUTPUT);
-                        completionLatch.countDown();
                     }
                 }
                 
@@ -299,19 +299,21 @@ public class NettyQuicOptimized {
                     } catch (IOException e) {
                         logger.warn("Error closing file channel", e);
                     }
-                    completionLatch.countDown();
                 }
             });
         }
+        
+
     }
 
-    // 🔥 MULTI-STREAM FILE RECEIVE HANDLER
+    // 🔥 PIPELINE STREAM FILE RECEIVE HANDLER
     static class FileReceiveHandler extends ChannelInboundHandlerAdapter {
         private static volatile java.io.FileOutputStream sharedFileOut;
         private static volatile String sharedFileName;
         private static final AtomicLong totalReceived = new AtomicLong(0);
         private static volatile long sharedStartTime = System.currentTimeMillis();
         private static final AtomicLong activeStreams = new AtomicLong(0);
+        private static final Object writeLock = new Object(); // 🔥 Synchronize writes
         
         @Override
         public void channelActive(ChannelHandlerContext ctx) {
@@ -340,12 +342,20 @@ public class NettyQuicOptimized {
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
             ByteBuf data = (ByteBuf) msg;
             try {
-                synchronized (FileReceiveHandler.class) {
+                // 🔥 FAST SYNCHRONIZED WRITE
+                synchronized (writeLock) {
                     if (sharedFileOut != null) {
                         byte[] bytes = new byte[data.readableBytes()];
                         data.readBytes(bytes);
                         sharedFileOut.write(bytes);
+                        sharedFileOut.flush(); // 🔥 Immediate flush for pipeline
                         totalReceived.addAndGet(bytes.length);
+                        
+                        if (bytes.length > 0) {
+                            logger.debug("Stream {} wrote {}KB, total: {}KB", 
+                                ctx.channel().id().asShortText(), 
+                                bytes.length / 1024, totalReceived.get() / 1024);
+                        }
                     }
                 }
             } catch (IOException e) {
