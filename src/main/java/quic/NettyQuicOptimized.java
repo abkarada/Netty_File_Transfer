@@ -194,31 +194,22 @@ public class NettyQuicOptimized {
             logger.info("🚀 Starting MULTI-STREAM transfer: {} streams, {}KB per stream", 
                        STREAM_COUNT, chunkPerStream / 1024);
             
-            // 🔥 CREATE AND START STREAMS WITH PROPER ACTIVATION
+            // 🔥 CREATE STREAMS WITH IMMEDIATE TRANSFER START
             for (int i = 0; i < STREAM_COUNT; i++) {
                 final int streamIndex = i;
                 final long startPos = i * chunkPerStream;
                 final long endPos = (i == STREAM_COUNT - 1) ? fileSize : (i + 1) * chunkPerStream;
                 
+                logger.info("🔧 Creating stream {} for bytes {}-{}", streamIndex, startPos, endPos);
+                
+                // Create stream with immediate transfer handler
                 QuicStreamChannel stream = quicChannel.createStream(QuicStreamType.BIDIRECTIONAL,
-                        new ChannelInboundHandlerAdapter() {
-                            @Override
-                            public void channelActive(ChannelHandlerContext ctx) {
-                                logger.info("✅ Stream {} activated! Starting transfer: bytes {}-{}", 
-                                    streamIndex, startPos, endPos);
-                                transferChunk((QuicStreamChannel) ctx.channel(), startPos, endPos, streamIndex);
-                            }
-                        }).get();
+                        new ChannelInboundHandlerAdapter()).get();
                 
-                logger.info("🔧 Created stream {} for bytes {}-{}", streamIndex, startPos, endPos);
+                logger.info("✅ Stream {} created, starting immediate transfer", streamIndex);
                 
-                // 🔥 TRIGGER ACTIVATION - Send a small initial write to activate the stream
-                stream.writeAndFlush(Unpooled.buffer(1).writeByte(0xFF))
-                    .addListener(future -> {
-                        if (!future.isSuccess()) {
-                            logger.warn("Failed to activate stream {}: {}", streamIndex, future.cause().getMessage());
-                        }
-                    });
+                // 🔥 START TRANSFER IMMEDIATELY WITHOUT MARKERS
+                transferChunk(stream, startPos, endPos, streamIndex);
             }
             
             // Wait for all streams to complete
@@ -314,37 +305,51 @@ public class NettyQuicOptimized {
         }
     }
 
-    // File receive handler for server
+    // 🔥 MULTI-STREAM FILE RECEIVE HANDLER
     static class FileReceiveHandler extends ChannelInboundHandlerAdapter {
-        private volatile java.io.FileOutputStream fileOut;
-        private final AtomicLong totalReceived = new AtomicLong(0);
-        private final long startTime = System.currentTimeMillis();
+        private static volatile java.io.FileOutputStream sharedFileOut;
+        private static volatile String sharedFileName;
+        private static final AtomicLong totalReceived = new AtomicLong(0);
+        private static volatile long sharedStartTime = System.currentTimeMillis();
+        private static final AtomicLong activeStreams = new AtomicLong(0);
         
         @Override
         public void channelActive(ChannelHandlerContext ctx) {
-            try {
-                String fileName = "received-files/received_" + System.currentTimeMillis() + ".dat";
-                new File("received-files").mkdirs();
-                fileOut = new java.io.FileOutputStream(fileName);
-                logger.info("Stream active, receiving to: {}", fileName);
-            } catch (IOException e) {
-                logger.error("Error creating output file", e);
-                ctx.close();
+            synchronized (FileReceiveHandler.class) {
+                if (sharedFileOut == null) {
+                    try {
+                        sharedFileName = "received-files/received_" + System.currentTimeMillis() + ".dat";
+                        new File("received-files").mkdirs();
+                        sharedFileOut = new java.io.FileOutputStream(sharedFileName);
+                        sharedStartTime = System.currentTimeMillis();
+                        logger.info("🔥 MULTI-STREAM: First stream active, receiving to: {}", sharedFileName);
+                    } catch (IOException e) {
+                        logger.error("Error creating shared output file", e);
+                        ctx.close();
+                        return;
+                    }
+                }
             }
+            
+            long streamCount = activeStreams.incrementAndGet();
+            logger.info("✅ Stream {} active (total active: {})", 
+                ctx.channel().id().asShortText(), streamCount);
         }
         
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
             ByteBuf data = (ByteBuf) msg;
             try {
-                if (fileOut != null) {
-                    byte[] bytes = new byte[data.readableBytes()];
-                    data.readBytes(bytes);
-                    fileOut.write(bytes);
-                    totalReceived.addAndGet(bytes.length);
+                synchronized (FileReceiveHandler.class) {
+                    if (sharedFileOut != null) {
+                        byte[] bytes = new byte[data.readableBytes()];
+                        data.readBytes(bytes);
+                        sharedFileOut.write(bytes);
+                        totalReceived.addAndGet(bytes.length);
+                    }
                 }
             } catch (IOException e) {
-                logger.error("Error writing to file", e);
+                logger.error("Error writing to shared file", e);
                 ctx.close();
             } finally {
                 data.release();
@@ -353,15 +358,32 @@ public class NettyQuicOptimized {
         
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
-            if (fileOut != null) {
-                try {
-                    fileOut.close();
-                    long duration = System.currentTimeMillis() - startTime;
-                    double throughputMbps = (totalReceived.get() * 8.0 / 1_000_000) / (duration / 1000.0);
-                    logger.info("Stream completed: {} bytes in {} ms ({:.2f} Mbps)", 
-                              totalReceived.get(), duration, throughputMbps);
-                } catch (IOException e) {
-                    logger.error("Error closing file", e);
+            long remainingStreams = activeStreams.decrementAndGet();
+            logger.info("❌ Stream {} inactive (remaining: {})", 
+                ctx.channel().id().asShortText(), remainingStreams);
+            
+            // Close shared file when all streams are done
+            if (remainingStreams == 0) {
+                synchronized (FileReceiveHandler.class) {
+                    if (sharedFileOut != null) {
+                        try {
+                            sharedFileOut.close();
+                            long duration = System.currentTimeMillis() - sharedStartTime;
+                            double throughputMbps = (totalReceived.get() * 8.0 / 1_000_000) / (duration / 1000.0);
+                            logger.info("🔥 MULTI-STREAM TRANSFER COMPLETED!");
+                            logger.info("  File: {}", sharedFileName);
+                            logger.info("  Total bytes: {}", totalReceived.get());
+                            logger.info("  Duration: {} ms", duration);
+                            logger.info("  Throughput: {:.2f} Mbps", throughputMbps);
+                            
+                            // Reset for next transfer
+                            sharedFileOut = null;
+                            sharedFileName = null;
+                            totalReceived.set(0);
+                        } catch (IOException e) {
+                            logger.error("Error closing shared file", e);
+                        }
+                    }
                 }
             }
         }
