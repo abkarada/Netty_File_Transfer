@@ -30,6 +30,9 @@ dependencies {
     // QUIC - şimdilik sadece Linux x86_64 için
     implementation "io.netty.incubator:netty-incubator-codec-native-quic:${nettyQuicVersion}:linux-x86_64"
     
+    // 🔥 NATIVE TRANSPORT: High performance Epoll
+    implementation "io.netty:netty-transport-native-epoll:${nettyVersion}:linux-x86_64"
+    
     // SSL için BouncyCastle
     implementation 'org.bouncycastle:bcpkix-jdk15on:1.70'
     implementation 'org.bouncycastle:bcprov-jdk15on:1.70'
