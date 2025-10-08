@@ -11,12 +11,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.net.InetSocketAddress;
+import java.nio.channels.AsynchronousFileChannel;
+import java.nio.ByteBuffer;
+import java.nio.channels.CompletionHandler;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
+import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.util.concurrent.DefaultThreadFactory;
 
 /**
  * QUIC tabanlı dosya transfer uygulaması
@@ -63,9 +69,11 @@ public class FileTransferMain {
     }
 
     static void runServer(int port) throws Exception {
-        logger.info("Starting QUIC server on port {}", port);
+        logger.info("Starting OPTIMIZED QUIC server on port {}", port);
         
-        NioEventLoopGroup group = new NioEventLoopGroup();
+        // High-performance event loop with single thread for server
+        NioEventLoopGroup group = new NioEventLoopGroup(1, 
+            new DefaultThreadFactory("quic-server", true));
         try {
             // SSL Context oluştur
             QuicSslContext sslContext = QuicSslContextBuilder.forServer(
@@ -76,15 +84,15 @@ public class FileTransferMain {
             .applicationProtocols(APPLICATION_PROTOCOL)
             .build();
 
-            // QUIC Server Codec oluştur
+            // QUIC Server Codec oluştur - EXTREME OPTIMIZATION
             ChannelHandler codec = new QuicServerCodecBuilder()
                     .sslContext(sslContext)
-                    .maxIdleTimeout(30000, java.util.concurrent.TimeUnit.MILLISECONDS) // 30s timeout
-                    .initialMaxData(100_000_000) // 100MB window - 10x artış
-                    .initialMaxStreamDataBidirectionalLocal(50_000_000) // 50MB per stream
-                    .initialMaxStreamDataBidirectionalRemote(50_000_000) // 50MB per stream
-                    .initialMaxStreamsBidirectional(100)
-                    .initialMaxStreamsUnidirectional(100)
+                    .maxIdleTimeout(120000, java.util.concurrent.TimeUnit.MILLISECONDS) // 120s timeout for large files
+                    .initialMaxData(2_000_000_000L) // 2GB total window - EXTREME
+                    .initialMaxStreamDataBidirectionalLocal(1_000_000_000L) // 1GB per stream
+                    .initialMaxStreamDataBidirectionalRemote(1_000_000_000L) // 1GB per stream
+                    .initialMaxStreamsBidirectional(1) // Single stream optimization
+                    .initialMaxStreamsUnidirectional(0) // Not needed
                     .tokenHandler(InsecureQuicTokenHandler.INSTANCE) // Test için
                     .handler(new ChannelInboundHandlerAdapter() {
                         @Override
@@ -111,6 +119,9 @@ public class FileTransferMain {
             Bootstrap bs = new Bootstrap();
             bs.group(group)
               .channel(NioDatagramChannel.class)
+              .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+              .option(ChannelOption.SO_SNDBUF, 8 * 1024 * 1024) // 8MB OS send buffer
+              .option(ChannelOption.SO_RCVBUF, 8 * 1024 * 1024) // 8MB OS receive buffer
               .handler(codec);
 
             Channel ch = bs.bind(port).sync().channel();
@@ -144,7 +155,9 @@ public class FileTransferMain {
         
         logger.info("File size: {} bytes", file.length());
         
-        NioEventLoopGroup group = new NioEventLoopGroup();
+        // High-performance event loop with single thread for client
+        NioEventLoopGroup group = new NioEventLoopGroup(1, 
+            new DefaultThreadFactory("quic-client", true));
         try {
             // SSL Context oluştur (client için)
             QuicSslContext sslContext = QuicSslContextBuilder.forClient()
@@ -155,14 +168,17 @@ public class FileTransferMain {
             Bootstrap bs = new Bootstrap();
             ChannelHandler clientCodec = new QuicClientCodecBuilder()
                     .sslContext(sslContext)
-                    .maxIdleTimeout(30000, java.util.concurrent.TimeUnit.MILLISECONDS) // 30s timeout
-                    .initialMaxData(100_000_000) // 100MB window - 10x artış
-                    .initialMaxStreamDataBidirectionalLocal(50_000_000) // 50MB per stream
-                    .initialMaxStreamDataBidirectionalRemote(50_000_000) // 50MB per stream
+                    .maxIdleTimeout(120000, java.util.concurrent.TimeUnit.MILLISECONDS) // 120s timeout for large files
+                    .initialMaxData(2_000_000_000L) // 2GB total window - EXTREME
+                    .initialMaxStreamDataBidirectionalLocal(1_000_000_000L) // 1GB per stream
+                    .initialMaxStreamDataBidirectionalRemote(1_000_000_000L) // 1GB per stream
                     .build();
             
             bs.group(group)
               .channel(NioDatagramChannel.class)
+              .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+              .option(ChannelOption.SO_SNDBUF, 8 * 1024 * 1024) // 8MB OS send buffer
+              .option(ChannelOption.SO_RCVBUF, 8 * 1024 * 1024) // 8MB OS receive buffer
               .handler(clientCodec);
 
             logger.debug("Connecting to server...");
@@ -284,15 +300,20 @@ public class FileTransferMain {
     }
     
     /**
-     * Client tarafında dosya gönderme handler'ı
+     * Client tarafında dosya gönderme handler'ı - ASYNC OPTIMIZED
      */
     static class FileStreamHandler extends ChannelInboundHandlerAdapter {
         private static final Logger logger = LoggerFactory.getLogger(FileStreamHandler.class);
         private final File file;
-        private FileInputStream fis;
-        private long totalSent = 0;
+        private AsynchronousFileChannel fileChannel;
+        private final AtomicLong position = new AtomicLong(0);
+        private final AtomicLong totalSent = new AtomicLong(0);
+        private final AtomicInteger activeReads = new AtomicInteger(0);
         private long startTime;
-        private int chunksWritten = 0;
+        private static final int CHUNK_SIZE = 2 * 1024 * 1024; // 2MB chunks - EXTREME
+        private static final int CONCURRENT_READS = 4; // 4 concurrent async reads
+        private volatile boolean fileCompleted = false;
+        private volatile ChannelHandlerContext channelContext;
         
         public FileStreamHandler(File file) {
             this.file = file;
@@ -300,84 +321,119 @@ public class FileTransferMain {
         
         @Override
         public void channelActive(ChannelHandlerContext ctx) throws Exception {
-            logger.info("File send stream activated, starting file transfer...");
+            channelContext = ctx;
+            logger.info("ASYNC File send stream activated for: {} ({})", 
+                    file.getName(), String.format("%.2f MB", file.length() / (1024.0 * 1024.0)));
             startTime = System.currentTimeMillis();
             
             try {
-                fis = new FileInputStream(file);
-                sendNextChunk(ctx);
+                // Async file channel aç - EXTREME PERFORMANCE
+                Path filePath = file.toPath();
+                fileChannel = AsynchronousFileChannel.open(filePath, StandardOpenOption.READ);
+                
+                // CONCURRENT async reads başlat - 4 pipeline
+                for (int i = 0; i < CONCURRENT_READS; i++) {
+                    initiateAsyncRead(ctx);
+                }
             } catch (IOException e) {
-                logger.error("Failed to open file for reading", e);
+                logger.error("Failed to open async file channel", e);
                 ctx.close();
             }
             
             super.channelActive(ctx);
         }
         
-        private void sendNextChunk(ChannelHandlerContext ctx) {
-            try {
-                // 1MB chunks - EXTREME size for maximum throughput
-                byte[] buffer = new byte[1024 * 1024];
-                int bytesRead = fis.read(buffer);
-                
-                if (bytesRead == -1) {
-                    // Dosya sonu - stream'i kapat
-                    logger.debug("End of file reached, closing stream");
-                    fis.close();
-                    ctx.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(ChannelFutureListener.CLOSE);
-                } else {
-                    // Direct buffer kullan - zero copy optimization
-                    ByteBuf buf = ctx.alloc().directBuffer(bytesRead);
-                    buf.writeBytes(buffer, 0, bytesRead);
-                    totalSent += bytesRead;
-                    
-                    logger.debug("Sending {} bytes, total sent: {} bytes", bytesRead, totalSent);
-                    
-                    chunksWritten++;
-                    
-                    // Flush every 4 chunks or on last chunk (optimize batching)
-                    if (chunksWritten % 4 == 0) {
-                        ctx.writeAndFlush(buf).addListener(future -> {
-                            if (future.isSuccess()) {
-                                sendNextChunk(ctx);
-                            } else {
-                                logger.error("Failed to send data chunk", future.cause());
-                                ctx.close();
-                            }
-                        });
-                    } else {
-                        ctx.write(buf).addListener(future -> {
-                            if (future.isSuccess()) {
-                                sendNextChunk(ctx);
-                            } else {
-                                logger.error("Failed to send data chunk", future.cause());
-                                ctx.close();
-                            }
-                        });
+        /**
+         * ASYNC dosya okuma işlemini başlat - EXTREME PERFORMANCE dengan 4 concurrent reads
+         */
+        private void initiateAsyncRead(ChannelHandlerContext ctx) {
+            if (fileCompleted) return;
+            
+            long currentPos = position.getAndAdd(CHUNK_SIZE);
+            if (currentPos >= file.length()) {
+                return; // EOF reached
+            }
+            
+            activeReads.incrementAndGet();
+            ByteBuffer buffer = ByteBuffer.allocateDirect(CHUNK_SIZE);
+            
+            fileChannel.read(buffer, currentPos, ctx, new CompletionHandler<Integer, ChannelHandlerContext>() {
+                @Override
+                public void completed(Integer bytesRead, ChannelHandlerContext attachment) {
+                    try {
+                        if (bytesRead > 0) {
+                            buffer.flip();
+                            
+                            // Direct ByteBuf kullan - zero copy optimization
+                            ByteBuf byteBuf = attachment.alloc().directBuffer(bytesRead);
+                            byteBuf.writeBytes(buffer);
+                            
+                            totalSent.addAndGet(bytesRead);
+                            
+                            logger.debug("ASYNC sending {} bytes, total: {} bytes", 
+                                    bytesRead, totalSent.get());
+                            
+                            // Immediate write and flush for max throughput
+                            attachment.writeAndFlush(byteBuf).addListener(future -> {
+                                if (future.isSuccess()) {
+                                    // Pipeline next read if file not finished
+                                    if (currentPos + CHUNK_SIZE < file.length()) {
+                                        initiateAsyncRead(attachment);
+                                    } else {
+                                        checkForCompletion(attachment);
+                                    }
+                                } else {
+                                    logger.error("ASYNC Write failed", future.cause());
+                                    attachment.close();
+                                }
+                            });
+                        } else {
+                            // EOF reached
+                            checkForCompletion(attachment);
+                        }
+                    } finally {
+                        activeReads.decrementAndGet();
                     }
                 }
-            } catch (IOException e) {
-                logger.error("Error reading file", e);
-                ctx.close();
+
+                @Override
+                public void failed(Throwable exc, ChannelHandlerContext attachment) {
+                    logger.error("ASYNC file read failed at position {}", currentPos, exc);
+                    activeReads.decrementAndGet();
+                    attachment.close();
+                }
+            });
+        }
+        
+        /**
+         * Transfer completion check
+         */
+        private void checkForCompletion(ChannelHandlerContext ctx) {
+            if (position.get() >= file.length() && activeReads.get() == 0 && !fileCompleted) {
+                fileCompleted = true;
+                logger.info("ASYNC file transfer COMPLETED - {} bytes transferred", totalSent.get());
+                ctx.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(ChannelFutureListener.CLOSE);
             }
         }
         
         @Override
         public void channelInactive(ChannelHandlerContext ctx) throws Exception {
             long duration = System.currentTimeMillis() - startTime;
-            double throughputMbps = (totalSent * 8.0 / 1_000_000) / (duration / 1000.0);
+            long totalBytes = totalSent.get();
+            double throughputMbps = (totalBytes * 8.0 / 1_000_000) / (duration / 1000.0);
             
-            logger.info("File send completed:");
+            logger.info("ASYNC File send completed:");
             logger.info("  File: {}", file.getName());
-            logger.info("  Total bytes: {}", totalSent);
+            logger.info("  Total bytes: {}", totalBytes);
             logger.info("  Duration: {} ms", duration);
             logger.info("  Throughput: {:.2f} Mbps", throughputMbps);
             
-            if (fis != null) {
+            // Async file channel'ı kapat
+            if (fileChannel != null) {
                 try {
-                    fis.close();
+                    fileChannel.close();
                 } catch (IOException e) {
-                    logger.warn("Error closing file input stream", e);
+                    logger.warn("Error closing async file channel", e);
                 }
             }
             
