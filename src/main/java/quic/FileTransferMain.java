@@ -21,6 +21,8 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.ConcurrentHashMap;
+import java.io.RandomAccessFile;
 import io.netty.buffer.PooledByteBufAllocator;
 
 /**
@@ -210,7 +212,7 @@ public class FileTransferMain {
 
             // Stream oluştur
             QuicStreamChannel stream = quicChannel.createStream(QuicStreamType.BIDIRECTIONAL, 
-                    new FileStreamHandler(file)).sync().getNow();
+                    new MultiStreamFileHandler(file)).sync().getNow();
             
             logger.info("File transfer started...");
             
@@ -228,15 +230,15 @@ public class FileTransferMain {
     }
     
     /**
-     * Server tarafında dosya alma handler'ı
+     * WEB RESEARCH: Multi-Stream File Receive Handler - Facebook/Cloudflare pattern
      */
     static class FileReceiveHandler extends ChannelInboundHandlerAdapter {
         private static final Logger logger = LoggerFactory.getLogger(FileReceiveHandler.class);
+        private static final String RECEIVED_FILES_DIR = "received-files";
         private long totalReceived = 0;
         private long startTime;
         private FileOutputStream fileOutputStream;
         private File receivedFile;
-        private static final String RECEIVED_FILES_DIR = "received-files";
         
         @Override
         public void channelActive(ChannelHandlerContext ctx) throws Exception {
@@ -315,152 +317,203 @@ public class FileTransferMain {
     }
     
     /**
-     * Client tarafında dosya gönderme handler'ı - ASYNC OPTIMIZED
+     * WEB RESEARCH: Multi-Stream File Transfer Handler - FACEBOOK/CLOUDFLARE APPROACH
      */
-    static class FileStreamHandler extends ChannelInboundHandlerAdapter {
-        private static final Logger logger = LoggerFactory.getLogger(FileStreamHandler.class);
+    static class MultiStreamFileHandler extends ChannelInboundHandlerAdapter {
+        private static final Logger logger = LoggerFactory.getLogger(MultiStreamFileHandler.class);
         private final File file;
-        private AsynchronousFileChannel fileChannel;
-        private final AtomicLong position = new AtomicLong(0);
-        private final AtomicLong totalSent = new AtomicLong(0);
-        private final AtomicInteger activeReads = new AtomicInteger(0);
         private long startTime;
-        private static final int CHUNK_SIZE = 2 * 1024 * 1024; // 2MB chunks - EXTREME
-        private static final int CONCURRENT_READS = 4; // 4 concurrent async reads
-        private volatile boolean fileCompleted = false;
-        private volatile ChannelHandlerContext channelContext;
+        private static final int STREAM_COUNT = 8; // WEB RESEARCH: 8 parallel streams like Facebook
+        private static final int CHUNK_SIZE = 4 * 1024 * 1024; // WEB RESEARCH: 4MB chunks
+        private final AtomicLong totalSent = new AtomicLong(0);
+        private final AtomicInteger completedStreams = new AtomicInteger(0);
         
-        public FileStreamHandler(File file) {
+        public MultiStreamFileHandler(File file) {
             this.file = file;
         }
         
         @Override
         public void channelActive(ChannelHandlerContext ctx) throws Exception {
-            channelContext = ctx;
-            logger.info("ASYNC File send stream activated for: {} ({})", 
+            logger.info("WEB RESEARCH: Multi-Stream File Transfer starting for: {} ({})", 
                     file.getName(), String.format("%.2f MB", file.length() / (1024.0 * 1024.0)));
             startTime = System.currentTimeMillis();
             
-            try {
-                // Async file channel aç - EXTREME PERFORMANCE
-                Path filePath = file.toPath();
-                fileChannel = AsynchronousFileChannel.open(filePath, StandardOpenOption.READ);
+            // WEB RESEARCH: Facebook/Cloudflare approach - multiple independent QUIC streams
+            QuicChannel quicChannel = (QuicChannel) ctx.channel().parent();
+            long fileSize = file.length();
+            long chunkSizePerStream = fileSize / STREAM_COUNT;
+            
+            logger.info("Creating {} parallel QUIC streams, {} MB per stream", 
+                    STREAM_COUNT, chunkSizePerStream / (1024.0 * 1024.0));
+            
+            // WEB RESEARCH: Create multiple parallel streams like Facebook does
+            for (int streamId = 0; streamId < STREAM_COUNT; streamId++) {
+                final int id = streamId;
+                final long startPos = streamId * chunkSizePerStream;
+                final long endPos = (streamId == STREAM_COUNT - 1) ? fileSize : (streamId + 1) * chunkSizePerStream;
                 
-                // CONCURRENT async reads başlat - 4 pipeline
-                for (int i = 0; i < CONCURRENT_READS; i++) {
-                    initiateAsyncRead(ctx);
-                }
-            } catch (IOException e) {
-                logger.error("Failed to open async file channel", e);
-                ctx.close();
+                quicChannel.createStream(QuicStreamType.BIDIRECTIONAL, 
+                    new StreamFileHandler(file, startPos, endPos, id, this))
+                    .addListener(future -> {
+                        if (future.isSuccess()) {
+                            logger.debug("Stream {} created successfully for range {}-{}", 
+                                    id, startPos, endPos);
+                        } else {
+                            logger.error("Failed to create stream {}", id, future.cause());
+                        }
+                    });
             }
             
             super.channelActive(ctx);
         }
         
         /**
-         * ASYNC dosya okuma işlemini başlat - EXTREME PERFORMANCE dengan 4 concurrent reads
+         * WEB RESEARCH: Stream completion notification from individual streams
          */
-        private void initiateAsyncRead(ChannelHandlerContext ctx) {
-            if (fileCompleted) return;
+        public void onStreamCompleted(long bytesTransferred) {
+            totalSent.addAndGet(bytesTransferred);
+            int completed = completedStreams.incrementAndGet();
             
-            long currentPos = position.getAndAdd(CHUNK_SIZE);
-            if (currentPos >= file.length()) {
-                return; // EOF reached
+            logger.info("Stream completed. {}/{} streams done, {} bytes total", 
+                    completed, STREAM_COUNT, totalSent.get());
+            
+            if (completed == STREAM_COUNT) {
+                long duration = System.currentTimeMillis() - startTime;
+                double throughputMbps = (totalSent.get() * 8.0 / 1_000_000) / (duration / 1000.0);
+                
+                logger.info("WEB RESEARCH: Multi-Stream Transfer COMPLETED!");
+                logger.info("  File: {}", file.getName());
+                logger.info("  Total bytes: {}", totalSent.get());
+                logger.info("  Streams used: {}", STREAM_COUNT);
+                logger.info("  Duration: {} ms", duration);
+                logger.info("  Throughput: {:.2f} Mbps", throughputMbps);
+            }
+        }
+    }
+    
+    /**
+     * WEB RESEARCH: Individual stream handler for file chunks - Facebook/Cloudflare pattern
+     */
+    static class StreamFileHandler extends ChannelInboundHandlerAdapter {
+        private static final Logger logger = LoggerFactory.getLogger(StreamFileHandler.class);
+        private final File file;
+        private final long startPos;
+        private final long endPos;
+        private final int streamId;
+        private final MultiStreamFileHandler parent;
+        private AsynchronousFileChannel fileChannel;
+        private final AtomicLong position;
+        private final AtomicLong streamSent = new AtomicLong(0);
+        private static final int STREAM_CHUNK_SIZE = 1024 * 1024; // 1MB per read
+        
+        public StreamFileHandler(File file, long startPos, long endPos, int streamId, MultiStreamFileHandler parent) {
+            this.file = file;
+            this.startPos = startPos;
+            this.endPos = endPos;
+            this.streamId = streamId;
+            this.parent = parent;
+            this.position = new AtomicLong(startPos);
+        }
+        
+        @Override
+        public void channelActive(ChannelHandlerContext ctx) throws Exception {
+            logger.debug("WEB RESEARCH: Stream {} active for range {}-{} ({} bytes)", 
+                    streamId, startPos, endPos, endPos - startPos);
+            
+            try {
+                // WEB RESEARCH: Each stream opens its own file channel
+                fileChannel = AsynchronousFileChannel.open(file.toPath(), StandardOpenOption.READ);
+                
+                // WEB RESEARCH: Send stream header with metadata
+                sendStreamHeader(ctx);
+                
+                // WEB RESEARCH: Start reading this stream's chunk
+                readNextChunk(ctx);
+                
+            } catch (IOException e) {
+                logger.error("Stream {} failed to open file channel", streamId, e);
+                ctx.close();
             }
             
-            activeReads.incrementAndGet();
-            ByteBuffer buffer = ByteBuffer.allocateDirect(CHUNK_SIZE);
+            super.channelActive(ctx);
+        }
+        
+        private void sendStreamHeader(ChannelHandlerContext ctx) {
+            // WEB RESEARCH: Send stream metadata like Facebook does
+            ByteBuf header = ctx.alloc().directBuffer(24);
+            header.writeLong(streamId);     // Stream ID
+            header.writeLong(startPos);     // Start position  
+            header.writeLong(endPos);       // End position
+            ctx.writeAndFlush(header);
+            
+            logger.debug("Stream {} header sent: pos={}-{}", streamId, startPos, endPos);
+        }
+        
+        private void readNextChunk(ChannelHandlerContext ctx) {
+            long currentPos = position.get();
+            if (currentPos >= endPos) {
+                // WEB RESEARCH: Stream completed, notify parent
+                logger.debug("Stream {} completed - {} bytes transferred", 
+                        streamId, streamSent.get());
+                parent.onStreamCompleted(streamSent.get());
+                ctx.close();
+                return;
+            }
+            
+            int chunkSize = (int) Math.min(STREAM_CHUNK_SIZE, endPos - currentPos);
+            ByteBuffer buffer = ByteBuffer.allocateDirect(chunkSize);
             
             fileChannel.read(buffer, currentPos, ctx, new CompletionHandler<Integer, ChannelHandlerContext>() {
                 @Override
                 public void completed(Integer bytesRead, ChannelHandlerContext attachment) {
-                    try {
-                        if (bytesRead > 0) {
-                            buffer.flip();
-                            
-                            // Direct ByteBuf kullan - zero copy optimization
-                            ByteBuf byteBuf = attachment.alloc().directBuffer(bytesRead);
-                            byteBuf.writeBytes(buffer);
-                            
-                            totalSent.addAndGet(bytesRead);
-                            
-                            logger.debug("ASYNC sending {} bytes, total: {} bytes", 
-                                    bytesRead, totalSent.get());
-                            
-                            // RESEARCH: Batched writing - flush every 16MB for optimal performance  
-                            attachment.write(byteBuf).addListener(future -> {
-                                if (future.isSuccess()) {
-                                    // RESEARCH: Batch flush every 16MB (8 chunks x 2MB)
-                                    if (totalSent.get() % (16 * 1024 * 1024) == 0) {
-                                        attachment.flush(); // Periodic flush
-                                    }
-                                    
-                                    // Pipeline next read if file not finished
-                                    if (currentPos + CHUNK_SIZE < file.length()) {
-                                        initiateAsyncRead(attachment);
-                                    } else {
-                                        checkForCompletion(attachment);
-                                    }
-                                } else {
-                                    logger.error("ASYNC Write failed", future.cause());
-                                    attachment.close();
-                                }
-                            });
-                        } else {
-                            // EOF reached
-                            checkForCompletion(attachment);
-                        }
-                    } finally {
-                        activeReads.decrementAndGet();
+                    if (bytesRead > 0) {
+                        buffer.flip();
+                        
+                        // WEB RESEARCH: Direct buffer transfer
+                        ByteBuf nettyBuf = attachment.alloc().directBuffer(bytesRead);
+                        nettyBuf.writeBytes(buffer);
+                        
+                        streamSent.addAndGet(bytesRead);
+                        position.set(currentPos + bytesRead);
+                        
+                        // WEB RESEARCH: Write and continue pipeline
+                        attachment.writeAndFlush(nettyBuf).addListener(future -> {
+                            if (future.isSuccess()) {
+                                readNextChunk(attachment); // Continue reading
+                            } else {
+                                logger.error("Stream {} write failed", streamId, future.cause());
+                                attachment.close();
+                            }
+                        });
+                    } else {
+                        // EOF or error
+                        logger.debug("Stream {} EOF reached", streamId);
+                        parent.onStreamCompleted(streamSent.get());
+                        attachment.close();
                     }
                 }
 
                 @Override
                 public void failed(Throwable exc, ChannelHandlerContext attachment) {
-                    logger.error("ASYNC file read failed at position {}", currentPos, exc);
-                    activeReads.decrementAndGet();
+                    logger.error("Stream {} read failed at position {}", streamId, currentPos, exc);
                     attachment.close();
                 }
             });
         }
         
-        /**
-         * Transfer completion check
-         */
-        private void checkForCompletion(ChannelHandlerContext ctx) {
-            if (position.get() >= file.length() && activeReads.get() == 0 && !fileCompleted) {
-                fileCompleted = true;
-                logger.info("ASYNC file transfer COMPLETED - {} bytes transferred", totalSent.get());
-                // RESEARCH: Final flush before close to ensure all data sent
-                ctx.flush(); 
-                ctx.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(ChannelFutureListener.CLOSE);
-            }
-        }
-        
         @Override
         public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-            long duration = System.currentTimeMillis() - startTime;
-            long totalBytes = totalSent.get();
-            double throughputMbps = (totalBytes * 8.0 / 1_000_000) / (duration / 1000.0);
-            
-            logger.info("ASYNC File send completed:");
-            logger.info("  File: {}", file.getName());
-            logger.info("  Total bytes: {}", totalBytes);
-            logger.info("  Duration: {} ms", duration);
-            logger.info("  Throughput: {:.2f} Mbps", throughputMbps);
-            
-            // Async file channel'ı kapat
             if (fileChannel != null) {
                 try {
                     fileChannel.close();
                 } catch (IOException e) {
-                    logger.warn("Error closing async file channel", e);
+                    logger.warn("Error closing file channel for stream {}", streamId, e);
                 }
             }
-            
             super.channelInactive(ctx);
         }
+        
+
         
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
