@@ -1,0 +1,74 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+group = 'com.quicc'
+version = '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+    // Netty incubator için snapshot repository
+    maven {
+        url 'https://oss.sonatype.org/content/repositories/snapshots/'
+    }
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}
+
+def nettyVersion = '4.1.70.Final'  // QUIC 0.0.21 ile uyumlu netty versiyonu
+def nettyQuicVersion = '0.0.21.Final'  // GitHub README'den önerilen versiyon
+
+dependencies {
+    // Netty core
+    implementation "io.netty:netty-all:${nettyVersion}"
+    
+    // QUIC - şimdilik sadece Linux x86_64 için
+    implementation "io.netty.incubator:netty-incubator-codec-native-quic:${nettyQuicVersion}:linux-x86_64"
+    
+    // SSL için BouncyCastle
+    implementation 'org.bouncycastle:bcpkix-jdk15on:1.70'
+    implementation 'org.bouncycastle:bcprov-jdk15on:1.70'
+    
+    // Logging
+    implementation 'ch.qos.logback:logback-classic:1.4.14'
+    implementation 'org.slf4j:slf4j-api:2.0.9'
+}
+
+application {
+    mainClass = 'quic.FileTransferMain'
+}
+
+// JVM args for better QUIC performance
+run {
+    jvmArgs = [
+        '-Dio.netty.leakDetection.level=paranoid',
+        '-Dfile.encoding=UTF-8'
+    ]
+}
+
+// Shadow JAR configuration for standalone executable
+shadowJar {
+    archiveBaseName = 'quic-transfer'
+    archiveClassifier = ''
+    archiveVersion = ''
+    
+    manifest {
+        attributes 'Main-Class': 'quic.FileTransferMain'
+    }
+    
+    // Native library handling for QUIC
+    mergeServiceFiles()
+    
+    // Exclude duplicate files
+    exclude 'META-INF/*.SF'
+    exclude 'META-INF/*.DSA'
+    exclude 'META-INF/*.RSA'
+}
+
+// Make shadowJar the default jar
+build.dependsOn shadowJar
