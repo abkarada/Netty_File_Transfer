@@ -194,19 +194,31 @@ public class NettyQuicOptimized {
             logger.info("🚀 Starting MULTI-STREAM transfer: {} streams, {}KB per stream", 
                        STREAM_COUNT, chunkPerStream / 1024);
             
-            // 🔥 DIRECT TRANSFER - NO WAITING FOR channelActive
+            // 🔥 CREATE AND START STREAMS WITH PROPER ACTIVATION
             for (int i = 0; i < STREAM_COUNT; i++) {
                 final int streamIndex = i;
                 final long startPos = i * chunkPerStream;
                 final long endPos = (i == STREAM_COUNT - 1) ? fileSize : (i + 1) * chunkPerStream;
                 
                 QuicStreamChannel stream = quicChannel.createStream(QuicStreamType.BIDIRECTIONAL,
-                        new ChannelInboundHandlerAdapter()).get();
+                        new ChannelInboundHandlerAdapter() {
+                            @Override
+                            public void channelActive(ChannelHandlerContext ctx) {
+                                logger.info("✅ Stream {} activated! Starting transfer: bytes {}-{}", 
+                                    streamIndex, startPos, endPos);
+                                transferChunk((QuicStreamChannel) ctx.channel(), startPos, endPos, streamIndex);
+                            }
+                        }).get();
                 
-                logger.info("🚀 Starting stream {} transfer: bytes {}-{}", streamIndex, startPos, endPos);
+                logger.info("🔧 Created stream {} for bytes {}-{}", streamIndex, startPos, endPos);
                 
-                // 🔥 START TRANSFER IMMEDIATELY
-                transferChunk(stream, startPos, endPos, streamIndex);
+                // 🔥 TRIGGER ACTIVATION - Send a small initial write to activate the stream
+                stream.writeAndFlush(Unpooled.buffer(1).writeByte(0xFF))
+                    .addListener(future -> {
+                        if (!future.isSuccess()) {
+                            logger.warn("Failed to activate stream {}: {}", streamIndex, future.cause().getMessage());
+                        }
+                    });
             }
             
             // Wait for all streams to complete
