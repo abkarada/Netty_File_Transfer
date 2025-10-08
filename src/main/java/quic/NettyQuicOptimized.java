@@ -15,10 +15,13 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
 import java.nio.channels.AsynchronousFileChannel;
 import java.nio.channels.CompletionHandler;
+import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -228,13 +231,22 @@ public class NettyQuicOptimized {
             long chunkStart = currentPosition.getAndAdd(CHUNK_SIZE);
             
             if (chunkStart >= fileSize) {
-                // No more chunks, close stream
-                logger.debug("Stream {} finished - no more chunks", streamIndex);
-                stream.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(QuicStreamChannel.SHUTDOWN_OUTPUT);
+                // No more chunks, close stream with FIN
+                logger.info("🏁 Stream {} finished - sending FIN", streamIndex);
+                stream.writeAndFlush(Unpooled.EMPTY_BUFFER)
+                    .addListener(QuicStreamChannel.SHUTDOWN_OUTPUT)
+                    .addListener(future -> {
+                        if (future.isSuccess()) {
+                            logger.debug("✅ Stream {} properly closed with FIN", streamIndex);
+                        } else {
+                            logger.warn("❌ Stream {} close failed: {}", streamIndex, future.cause().getMessage());
+                        }
+                    });
                 
                 // Check if all done
                 if (totalSent.get() >= fileSize) {
                     transferComplete = true;
+                    logger.info("🔥 ALL STREAMS COMPLETED! Total sent: {}KB", totalSent.get() / 1024);
                 }
                 return;
             }
@@ -279,15 +291,20 @@ public class NettyQuicOptimized {
                                 logger.debug("Stream {} sent {}KB, total: {}KB", 
                                     streamIndex, bytesRead / 1024, totalSent.get() / 1024);
                                 
-                                // 🔥 IMMEDIATELY REQUEST NEXT CHUNK
+                                // 🔥 REQUEST NEXT CHUNK OR FINISH STREAM
                                 sendNextChunk(attachment, streamIndex);
                             } else {
                                 logger.error("Write failed for stream {}", streamIndex, future.cause());
+                                // 🔥 CLOSE STREAM ON ERROR
+                                attachment.writeAndFlush(Unpooled.EMPTY_BUFFER)
+                                    .addListener(QuicStreamChannel.SHUTDOWN_OUTPUT);
                             }
                         });
                     } else {
-                        logger.debug("Stream {} read 0 bytes", streamIndex);
-                        attachment.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(QuicStreamChannel.SHUTDOWN_OUTPUT);
+                        logger.debug("Stream {} read 0 bytes - closing", streamIndex);
+                        // 🔥 PROPER STREAM TERMINATION WITH FIN
+                        attachment.writeAndFlush(Unpooled.EMPTY_BUFFER)
+                            .addListener(QuicStreamChannel.SHUTDOWN_OUTPUT);
                     }
                 }
                 
@@ -299,6 +316,9 @@ public class NettyQuicOptimized {
                     } catch (IOException e) {
                         logger.warn("Error closing file channel", e);
                     }
+                    // 🔥 CLOSE STREAM ON FAILURE
+                    attachment.writeAndFlush(Unpooled.EMPTY_BUFFER)
+                        .addListener(QuicStreamChannel.SHUTDOWN_OUTPUT);
                 }
             });
         }
@@ -306,27 +326,37 @@ public class NettyQuicOptimized {
 
     }
 
-    // 🔥 PIPELINE STREAM FILE RECEIVE HANDLER
+    // 🔥 MAPPED BYTE BUFFER HIGH-PERFORMANCE FILE RECEIVE HANDLER
     static class FileReceiveHandler extends ChannelInboundHandlerAdapter {
-        private static volatile java.io.FileOutputStream sharedFileOut;
+        private static volatile MappedByteBuffer mappedBuffer;
+        private static volatile RandomAccessFile randomAccessFile;
         private static volatile String sharedFileName;
         private static final AtomicLong totalReceived = new AtomicLong(0);
         private static volatile long sharedStartTime = System.currentTimeMillis();
         private static final AtomicLong activeStreams = new AtomicLong(0);
-        private static final Object writeLock = new Object(); // 🔥 Synchronize writes
+        private static final long EXPECTED_FILE_SIZE = 10 * 1024 * 1024; // 10MB expected
         
         @Override
         public void channelActive(ChannelHandlerContext ctx) {
             synchronized (FileReceiveHandler.class) {
-                if (sharedFileOut == null) {
+                if (mappedBuffer == null) {
                     try {
                         sharedFileName = "received-files/received_" + System.currentTimeMillis() + ".dat";
                         new File("received-files").mkdirs();
-                        sharedFileOut = new java.io.FileOutputStream(sharedFileName);
+                        
+                        // 🔥 CREATE MAPPED BYTE BUFFER FOR HIGH PERFORMANCE RANDOM ACCESS
+                        randomAccessFile = new RandomAccessFile(sharedFileName, "rw");
+                        randomAccessFile.setLength(EXPECTED_FILE_SIZE); // Pre-allocate file
+                        
+                        FileChannel fileChannel = randomAccessFile.getChannel();
+                        mappedBuffer = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, EXPECTED_FILE_SIZE);
+                        mappedBuffer.load(); // 🔥 PRELOAD INTO MEMORY
+                        
                         sharedStartTime = System.currentTimeMillis();
-                        logger.info("🔥 MULTI-STREAM: First stream active, receiving to: {}", sharedFileName);
+                        logger.info("🔥 MAPPED BUFFER: First stream active, mapped file: {} ({}MB)", 
+                            sharedFileName, EXPECTED_FILE_SIZE / (1024 * 1024));
                     } catch (IOException e) {
-                        logger.error("Error creating shared output file", e);
+                        logger.error("Error creating mapped buffer file", e);
                         ctx.close();
                         return;
                     }
@@ -342,24 +372,36 @@ public class NettyQuicOptimized {
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
             ByteBuf data = (ByteBuf) msg;
             try {
-                // 🔥 FAST SYNCHRONIZED WRITE
-                synchronized (writeLock) {
-                    if (sharedFileOut != null) {
-                        byte[] bytes = new byte[data.readableBytes()];
-                        data.readBytes(bytes);
-                        sharedFileOut.write(bytes);
-                        sharedFileOut.flush(); // 🔥 Immediate flush for pipeline
-                        totalReceived.addAndGet(bytes.length);
+                if (mappedBuffer != null) {
+                    int bytesToWrite = data.readableBytes();
+                    long currentPos = totalReceived.getAndAdd(bytesToWrite);
+                    
+                    // 🔥 DIRECT RANDOM ACCESS WRITE TO MAPPED BUFFER
+                    if (currentPos + bytesToWrite <= EXPECTED_FILE_SIZE) {
+                        // Create temporary array for transfer
+                        byte[] tempArray = new byte[bytesToWrite];
+                        data.readBytes(tempArray);
+                        mappedBuffer.position((int)currentPos);
+                        mappedBuffer.put(tempArray);
                         
-                        if (bytes.length > 0) {
-                            logger.debug("Stream {} wrote {}KB, total: {}KB", 
-                                ctx.channel().id().asShortText(), 
-                                bytes.length / 1024, totalReceived.get() / 1024);
+                        // Force write every 1MB
+                        if ((currentPos + bytesToWrite) % (1024 * 1024) == 0) {
+                            mappedBuffer.force(); // 🔥 FORCE TO DISK
+                            logger.debug("💾 Forced write at {}MB", (currentPos + bytesToWrite) / (1024 * 1024));
                         }
+                        
+                        if (bytesToWrite > 0) {
+                            logger.debug("Stream {} wrote {}KB at pos {}, total: {}KB", 
+                                ctx.channel().id().asShortText(), 
+                                bytesToWrite / 1024, currentPos / 1024, totalReceived.get() / 1024);
+                        }
+                    } else {
+                        logger.warn("File size exceeded! Current: {}, Writing: {}, Max: {}", 
+                            currentPos, bytesToWrite, EXPECTED_FILE_SIZE);
                     }
                 }
-            } catch (IOException e) {
-                logger.error("Error writing to shared file", e);
+            } catch (Exception e) {
+                logger.error("Error writing to mapped buffer", e);
                 ctx.close();
             } finally {
                 data.release();
@@ -372,26 +414,34 @@ public class NettyQuicOptimized {
             logger.info("❌ Stream {} inactive (remaining: {})", 
                 ctx.channel().id().asShortText(), remainingStreams);
             
-            // Close shared file when all streams are done
+            // Close mapped buffer when all streams are done
             if (remainingStreams == 0) {
                 synchronized (FileReceiveHandler.class) {
-                    if (sharedFileOut != null) {
+                    if (mappedBuffer != null) {
                         try {
-                            sharedFileOut.close();
+                            // 🔥 FINAL FORCE WRITE AND CLEANUP
+                            mappedBuffer.force(); // Final force to disk
+                            
+                            // Trim file to actual size
+                            long actualSize = totalReceived.get();
+                            randomAccessFile.setLength(actualSize);
+                            randomAccessFile.close();
+                            
                             long duration = System.currentTimeMillis() - sharedStartTime;
-                            double throughputMbps = (totalReceived.get() * 8.0 / 1_000_000) / (duration / 1000.0);
-                            logger.info("🔥 MULTI-STREAM TRANSFER COMPLETED!");
+                            double throughputMbps = (actualSize * 8.0 / 1_000_000) / (duration / 1000.0);
+                            logger.info("🔥 MAPPED BUFFER TRANSFER COMPLETED!");
                             logger.info("  File: {}", sharedFileName);
-                            logger.info("  Total bytes: {}", totalReceived.get());
+                            logger.info("  Total bytes: {}", actualSize);
                             logger.info("  Duration: {} ms", duration);
                             logger.info("  Throughput: {:.2f} Mbps", throughputMbps);
                             
                             // Reset for next transfer
-                            sharedFileOut = null;
+                            mappedBuffer = null;
+                            randomAccessFile = null;
                             sharedFileName = null;
                             totalReceived.set(0);
                         } catch (IOException e) {
-                            logger.error("Error closing shared file", e);
+                            logger.error("Error closing mapped buffer", e);
                         }
                     }
                 }
