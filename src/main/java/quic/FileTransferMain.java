@@ -91,8 +91,8 @@ public class FileTransferMain {
             // QUIC Server Codec oluştur - EXTREME OPTIMIZATION
             ChannelHandler codec = new QuicServerCodecBuilder()
                     .sslContext(sslContext)
-                    .maxIdleTimeout(30000, java.util.concurrent.TimeUnit.MILLISECONDS) // RESEARCH: Production timeout
-                    .initialMaxData(50_000_000L) // RESEARCH: 50MB optimal (not 2GB!)
+                    .maxIdleTimeout(600000, java.util.concurrent.TimeUnit.MILLISECONDS) // EMERGENCY: 10 minutes timeout
+                    .initialMaxData(200_000_000L) // EMERGENCY: 200MB for large files
                     .initialMaxStreamDataBidirectionalLocal(10_000_000L) // RESEARCH: 10MB per stream
                     .initialMaxStreamDataBidirectionalRemote(10_000_000L) // RESEARCH: 10MB per stream
                     .initialMaxStreamsBidirectional(100) // RESEARCH: Support multiple streams
@@ -180,8 +180,8 @@ public class FileTransferMain {
             Bootstrap bs = new Bootstrap();
             ChannelHandler clientCodec = new QuicClientCodecBuilder()
                     .sslContext(sslContext)
-                    .maxIdleTimeout(30000, java.util.concurrent.TimeUnit.MILLISECONDS) // RESEARCH: Production timeout
-                    .initialMaxData(50_000_000L) // RESEARCH: 50MB optimal
+                    .maxIdleTimeout(600000, java.util.concurrent.TimeUnit.MILLISECONDS) // ❗ EMERGENCY: 10 minutes matching server
+                    .initialMaxData(200_000_000L) // EMERGENCY: 200MB data window to prevent ACK-only traffic
                     .initialMaxStreamDataBidirectionalLocal(10_000_000L) // RESEARCH: 10MB per stream
                     .initialMaxStreamDataBidirectionalRemote(10_000_000L) // RESEARCH: 10MB per stream
                     .maxRecvUdpPayloadSize(1200) // ❗ CRITICAL: MTU-safe packet size
@@ -334,37 +334,93 @@ public class FileTransferMain {
         
         @Override
         public void channelActive(ChannelHandlerContext ctx) throws Exception {
-            logger.info("WEB RESEARCH: Multi-Stream File Transfer starting for: {} ({})", 
+            logger.info("EMERGENCY FIX: Single-Stream High-Performance Transfer for: {} ({})", 
                     file.getName(), String.format("%.2f MB", file.length() / (1024.0 * 1024.0)));
             startTime = System.currentTimeMillis();
             
-            // WEB RESEARCH: Facebook/Cloudflare approach - multiple independent QUIC streams
-            QuicChannel quicChannel = (QuicChannel) ctx.channel().parent();
-            long fileSize = file.length();
-            long chunkSizePerStream = fileSize / STREAM_COUNT;
-            
-            logger.info("Creating {} parallel QUIC streams, {} MB per stream", 
-                    STREAM_COUNT, chunkSizePerStream / (1024.0 * 1024.0));
-            
-            // WEB RESEARCH: Create multiple parallel streams like Facebook does
-            for (int streamId = 0; streamId < STREAM_COUNT; streamId++) {
-                final int id = streamId;
-                final long startPos = streamId * chunkSizePerStream;
-                final long endPos = (streamId == STREAM_COUNT - 1) ? fileSize : (streamId + 1) * chunkSizePerStream;
+            // EMERGENCY: Single stream with extreme optimization
+            try {
+                Path filePath = file.toPath();
+                AsynchronousFileChannel fileChannel = AsynchronousFileChannel.open(filePath, StandardOpenOption.READ);
                 
-                quicChannel.createStream(QuicStreamType.BIDIRECTIONAL, 
-                    new StreamFileHandler(file, startPos, endPos, id, this))
-                    .addListener(future -> {
-                        if (future.isSuccess()) {
-                            logger.debug("Stream {} created successfully for range {}-{}", 
-                                    id, startPos, endPos);
-                        } else {
-                            logger.error("Failed to create stream {}", id, future.cause());
-                        }
-                    });
+                // EMERGENCY: Direct massive chunk reading
+                sendFileInChunks(ctx, fileChannel, 0);
+                
+            } catch (IOException e) {
+                logger.error("Failed to open file channel", e);
+                ctx.close();
             }
             
             super.channelActive(ctx);
+        }
+        
+        private void sendFileInChunks(ChannelHandlerContext ctx, AsynchronousFileChannel fileChannel, long position) {
+            if (position >= file.length()) {
+                // Transfer complete
+                long duration = System.currentTimeMillis() - startTime;
+                double throughputMbps = (totalSent.get() * 8.0 / 1_000_000) / (duration / 1000.0);
+                
+                logger.info("EMERGENCY SINGLE-STREAM Transfer COMPLETED!");
+                logger.info("  Total bytes: {}", totalSent.get());
+                logger.info("  Duration: {} ms", duration);
+                logger.info("  Throughput: {:.2f} Mbps", throughputMbps);
+                
+                try {
+                    fileChannel.close();
+                } catch (IOException e) {
+                    logger.warn("Error closing file channel", e);
+                }
+                ctx.close();
+                return;
+            }
+            
+            int chunkSize = (int) Math.min(8 * 1024 * 1024, file.length() - position); // 8MB chunks
+            ByteBuffer buffer = ByteBuffer.allocateDirect(chunkSize);
+            
+            fileChannel.read(buffer, position, ctx, new CompletionHandler<Integer, ChannelHandlerContext>() {
+                @Override
+                public void completed(Integer bytesRead, ChannelHandlerContext attachment) {
+                    if (bytesRead > 0) {
+                        buffer.flip();
+                        
+                        // Direct transfer
+                        ByteBuf nettyBuf = attachment.alloc().directBuffer(bytesRead);
+                        nettyBuf.writeBytes(buffer);
+                        
+                        totalSent.addAndGet(bytesRead);
+                        
+                        // EMERGENCY: Immediate flush
+                        attachment.writeAndFlush(nettyBuf).addListener(future -> {
+                            if (future.isSuccess()) {
+                                // Continue with next chunk
+                                sendFileInChunks(attachment, fileChannel, position + bytesRead);
+                            } else {
+                                logger.error("Write failed", future.cause());
+                                attachment.close();
+                            }
+                        });
+                    } else {
+                        // EOF
+                        try {
+                            fileChannel.close();
+                        } catch (IOException e) {
+                            logger.warn("Error closing file channel", e);
+                        }
+                        attachment.close();
+                    }
+                }
+
+                @Override
+                public void failed(Throwable exc, ChannelHandlerContext attachment) {
+                    logger.error("File read failed at position {}", position, exc);
+                    try {
+                        fileChannel.close();
+                    } catch (IOException e) {
+                        logger.warn("Error closing file channel", e);
+                    }
+                    attachment.close();
+                }
+            });
         }
         
         /**
