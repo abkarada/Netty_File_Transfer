@@ -30,14 +30,21 @@ public class SimpleQuicFileTransfer {
     
     public static void main(String[] args) throws Exception {
         if (args.length < 1) {
-            System.err.println("Usage: java SimpleQuicFileTransfer <server|client> [host] [port] [file]");
+            System.err.println("Usage:");
+            System.err.println("  Server: java SimpleQuicFileTransfer server [port]");
+            System.err.println("  Client: java SimpleQuicFileTransfer client <host> [port] [file]");
             return;
         }
         
         if ("server".equals(args[0])) {
-            runServer();
+            int port = args.length > 1 ? Integer.parseInt(args[1]) : 9999;
+            runServer(port);
         } else if ("client".equals(args[0])) {
-            String host = args.length > 1 ? args[1] : "localhost";
+            if (args.length < 2) {
+                System.err.println("❌ Client needs host IP! Usage: client <host> [port] [file]");
+                return;
+            }
+            String host = args[1];
             int port = args.length > 2 ? Integer.parseInt(args[2]) : 9999;
             String file = args.length > 3 ? args[3] : "test-files/test_10mb.bin";
             runClient(host, port, file);
@@ -45,8 +52,8 @@ public class SimpleQuicFileTransfer {
     }
     
     // 🚀 SERVER - Basit ve direkt Netty örneğinden
-    public static void runServer() throws Exception {
-        logger.info("🔥 Starting QUIC Server on port 9999");
+    public static void runServer(int port) throws Exception {
+        logger.info("🔥 Starting QUIC Server on port {}", port);
         
         SelfSignedCertificate cert = new SelfSignedCertificate();
         QuicSslContext context = QuicSslContextBuilder.forServer(
@@ -77,10 +84,10 @@ public class SimpleQuicFileTransfer {
             Channel channel = bs.group(group)
                     .channel(NioDatagramChannel.class)
                     .handler(codec)
-                    .bind(new InetSocketAddress(9999))
+                    .bind(new InetSocketAddress(port))
                     .sync().channel();
                     
-            logger.info("🚀 Server started on port 9999");
+            logger.info("🚀 Server started on port {}", port);
             channel.closeFuture().sync();
         } finally {
             group.shutdownGracefully();
